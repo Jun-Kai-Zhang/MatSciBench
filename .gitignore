@@ -1,0 +1,11 @@
+.pycache/
+*/.pycache/*
+*.pyc
+*.pyo
+*.pyd
+*.pyw
+*.pyz
+*.pywz
+.DS_Store
+results/
+
