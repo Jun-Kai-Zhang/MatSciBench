@@ -1,4 +1,5 @@
 from utils import generate_with_api, extract_final_answer
+from utils.vllm_api import generate_with_vllm
 from methods.prompts import SYSTEM_PROMPT, FEEDBACK_PROMPT, CORRECTION_PROMPT
 
 def self_correction(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
@@ -37,9 +38,9 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
         ]
 
         if model_type == "vllm":  # vLLM model
-            output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-            initial_output = output[0].outputs[0].text.strip()
-            initial_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
+            initial_output = response["text"].strip()
+            initial_token_nums = response["token_ids"]
         else:
             initial_output, initial_token_nums = generate_with_api(
                 model_type,
@@ -60,9 +61,9 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
         ]
 
         if model_type == "vllm":
-            output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-            review_output = output[0].outputs[0].text.strip()
-            review_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
+            review_output = response["text"].strip()
+            review_token_nums = response["token_ids"]
         else:
             review_output, review_token_nums = generate_with_api(
                 model_type,
@@ -85,9 +86,9 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
         ]
 
         if model_type == "vllm":
-            output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-            final_output = output[0].outputs[0].text.strip()
-            final_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
+            final_output = response["text"].strip()
+            final_token_nums = response["token_ids"]
         else:
             final_output, final_token_nums = generate_with_api(
                 model_type,

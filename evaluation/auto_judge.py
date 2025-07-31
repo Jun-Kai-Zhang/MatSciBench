@@ -7,7 +7,7 @@ import signal
 import time
 import psutil
 import multiprocessing
-from evaluation.prompts import judge_user_prompt, JUDGE_SYSTEM_PROMPT
+from evaluation.prompts import JUDGE_SYSTEM_PROMPT, JUDGE_USER_PROMPT
 from utils import extract_final_answer, extract_number, generate_with_api
 from evaluation.grader import math_equal
 
@@ -24,13 +24,13 @@ def judge_response_with_gemini(model_answer, correct_answer, question, api_key):
             api_key = os.environ.get("GEMINI_API_KEY", None)
         if not api_key:
             print("Warning: No Gemini API key available for judging questions.")
-            return
+            return {"is_correct": False, "judge_reasoning": "No Gemini API key available."}
         genai.configure(api_key=api_key)
-        model = "gemini-2.0-flash"
+        model = "gemini-2.5-flash-lite"
         
         conversation = [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": judge_user_prompt(correct_answer, model_answer, question)}
+            {"role": "user", "content": JUDGE_USER_PROMPT.format(question=question, correct_answer=correct_answer, model_answer=model_answer)}
         ]
         
         response, _ = generate_with_api("gemini", model, conversation, 4096, 0.0, [])
@@ -200,41 +200,54 @@ def normalize_scientific_notation(answer_str):
         return answer_str
 
 
-def judge_single_response(pred, gemini_api_key=None, use_llm=True, rule_timeout=20):
+def judge_single_response(pred, gemini_api_key=None, use_llm=True, use_rule=True, rule_timeout=20):
     """Judge if a response is correct"""
-    # print(pred["final_answer"], pred["correct_answer"])
-    judge_result_rule = judge_response_with_rule(pred["final_answer"], pred["correct_answer"], 
-                                               pred.get("multiple", False), timeout=rule_timeout)
-    # print(judge_result_rule)
-    # Always store the rule-based judgment in separate fields
-    pred["rule_is_correct"] = judge_result_rule["is_correct"]
-    pred["rule_judge_reasoning"] = judge_result_rule["judge_reasoning"]
+    # Initialize variables
+    judge_result_rule = None
+    judge_result_llm = None
     
-    # Check if this is a formula question - only use LLM for formula questions
+    # Run rule-based judging if enabled
+    if use_rule:
+        judge_result_rule = judge_response_with_rule(pred["final_answer"], pred["correct_answer"], 
+                                                   pred.get("multiple", False), timeout=rule_timeout)
+        # Store the rule-based judgment in separate fields
+        pred["rule_is_correct"] = judge_result_rule["is_correct"]
+        pred["rule_judge_reasoning"] = judge_result_rule["judge_reasoning"]
+    
+    # Check if this is a formula question for special handling
     is_formula_question = pred.get("question_type", "").upper() == "FORMULA"
     
-    # Use LLM only if requested AND it's a formula question
-    if use_llm and is_formula_question:
+    # Run LLM judging if enabled (for all question types when requested)
+    if use_llm:
         judge_result_llm = judge_response_with_gemini(pred["final_answer"], pred["correct_answer"], pred["question"], gemini_api_key)
         # Store the LLM judgment in separate fields
         pred["llm_is_correct"] = judge_result_llm["is_correct"]
         pred["llm_judge_reasoning"] = judge_result_llm["judge_reasoning"]
-        
-        # If LLM judge returns an empty response, use rule-based correctness
+    
+    # Determine final judgment based on what's available
+    if judge_result_llm and judge_result_rule:
+        # Both available - prefer LLM for formula questions
         if not judge_result_llm.get("judge_reasoning") or judge_result_llm.get("judge_reasoning", "").strip() == "":
             pred["is_correct"] = judge_result_rule["is_correct"]
             pred["judge_reasoning"] = f"LLM response was empty. Using rule-based judgment: {judge_result_rule['judge_reasoning']}"
         else:
-            # Use LLM judgment for formula questions when they disagree
             pred["is_correct"] = judge_result_llm["is_correct"]
             pred["judge_reasoning"] = f"LLM: {judge_result_llm['judge_reasoning']}\nRule: {judge_result_rule['judge_reasoning']}"
-    else:
-        # Only use rule-based judgment when use_llm is False or it's not a formula question
+    elif judge_result_llm:
+        # Only LLM available
+        pred["is_correct"] = judge_result_llm["is_correct"]
+        pred["judge_reasoning"] = f"LLM: {judge_result_llm['judge_reasoning']}"
+    elif judge_result_rule:
+        # Only rule available
         pred["is_correct"] = judge_result_rule["is_correct"]
         if is_formula_question:
             pred["judge_reasoning"] = f"Rule (formula): {judge_result_rule['judge_reasoning']}"
         else:
             pred["judge_reasoning"] = f"Rule: {judge_result_rule['judge_reasoning']}"
+    else:
+        # Neither available - should not happen if validation is correct
+        pred["is_correct"] = False
+        pred["judge_reasoning"] = "Error: No judging method available"
 
     # Preserve the error field if it exists
     if "error" in pred:
@@ -244,7 +257,7 @@ def judge_single_response(pred, gemini_api_key=None, use_llm=True, rule_timeout=
 
     return pred
 
-def judge_responses(predictions, gemini_api_key=None, max_workers=8, use_llm=True, rule_timeout=240):
+def judge_responses(predictions, gemini_api_key=None, max_workers=64, use_llm=True, use_rule=True, rule_timeout=240):
     """Process all judgments in parallel"""
     
     # First, process all final answers
@@ -266,6 +279,7 @@ def judge_responses(predictions, gemini_api_key=None, max_workers=8, use_llm=Tru
                 pred,
                 gemini_api_key,
                 use_llm,
+                use_rule,
                 rule_timeout
             )
             future_to_index[future] = i
@@ -304,6 +318,7 @@ def judge_responses(predictions, gemini_api_key=None, max_workers=8, use_llm=Tru
                     temp_pred,
                     gemini_api_key,
                     use_llm,
+                    use_rule,
                     rule_timeout
                 )
                 future_to_index[future] = i

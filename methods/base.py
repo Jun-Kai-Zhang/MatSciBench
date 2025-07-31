@@ -1,4 +1,5 @@
 from utils import generate_with_api, extract_final_answer
+from utils.vllm_api import generate_with_vllm
 
 from methods.prompts import SYSTEM_PROMPT
 
@@ -38,9 +39,9 @@ def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_p
         ]
         # print("image path: ", image_paths)
         if model_type == "vllm":  # vLLM model
-            output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-            full_output = output[0].outputs[0].text.strip()
-            new_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
+            full_output = response["text"].strip()
+            new_token_nums = response["token_ids"]
             error = None
         else:
             full_output, new_token_nums = generate_with_api(

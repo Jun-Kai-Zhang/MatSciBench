@@ -1,4 +1,5 @@
 from utils import generate_with_api, extract_final_answer
+from utils.vllm_api import generate_with_vllm
 from methods.prompts import SYSTEM_PROMPT
 from collections import Counter
 
@@ -57,9 +58,9 @@ def self_consistency(entry, model, max_tokens, temperature, model_type, llm=None
                     from vllm import SamplingParams
                     modified_params = SamplingParams(**params_dict)
                 
-                output = llm.chat(conversation, sampling_params=modified_params, use_tqdm=False)
-                full_output = output[0].outputs[0].text.strip()
-                tokens = len(output[0].outputs[0].token_ids)
+                response = generate_with_vllm(llm, modified_params, conversation, image_paths)
+                full_output = response["text"].strip()
+                tokens = response["token_ids"]
             else:
                 full_output, tokens = generate_with_api(
                     model_type,

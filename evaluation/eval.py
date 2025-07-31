@@ -1,8 +1,12 @@
 import argparse
 import os
+os.environ["VLLM_CACHE_ROOT"] = "/tmp/vllm_cache"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import re
 import csv  # Add CSV import
 from tqdm import tqdm
+from datetime import datetime
 
 import openai
 import google.generativeai as genai
@@ -17,7 +21,7 @@ from evaluation.auto_judge import judge_responses
 # Define multimodal and text-only model lists
 MULTIMODAL_MODELS = [
     "gpt-4o", 
-    "gpt-4.1",
+    # "gpt-4.1",
     "o4-mini",
     "o3",
 
@@ -30,7 +34,7 @@ MULTIMODAL_MODELS = [
     
     "qwen2.5-vl-32b-instruct",
 
-    "llama-4-maverick"
+    # "llama-4-maverick"
 ]
 
 # Other models are considered text-only by default
@@ -62,6 +66,8 @@ def parse_args():
                         help="Lambda API key (will use LAMBDA_API_KEY env var if not provided).")
     parser.add_argument("--llm_judge", action="store_true",
                         help="Use LLM to judge the correctness of the answer.")
+    parser.add_argument("--rule_judge", action="store_true",
+                        help="Use rule-based judging for correctness of the answer.")
     parser.add_argument("--num_workers", type=int, default=None,
                         help="Number of workers to use for parallel processing.")
     parser.add_argument("--output_dir", type=str, default="results/evaluation",
@@ -76,6 +82,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Validate that at least one judge is enabled
+    if not args.llm_judge and not args.rule_judge:
+        print("Error: At least one of --llm_judge or --rule_judge must be specified.")
+        return
 
     # Load the QA dataset from CSV.
     try:
@@ -103,7 +114,7 @@ def main():
     is_gemini_model = args.model.startswith("gemini")
     is_claude_model = args.model.startswith("claude")
     is_deepseek_model = args.model.startswith("deepseek")
-    is_qwen_model = args.model.startswith("qwen") or args.model.startswith("qwq")
+    is_qwen_model = args.model.startswith("qwen3") or args.model.startswith("qwq")
     is_llama_model = args.model.startswith("llama")
     model_type = "vllm"  # default
     
@@ -161,9 +172,21 @@ def main():
         model_type = "llama"
     else:
         from vllm import LLM, SamplingParams
+        import torch
         # Initialize the vLLM engine for the specified model.
         print(f"Using vLLM model: {args.model}")
-        llm = LLM(model=args.model)
+        
+        # Use all available GPUs
+        gpu_count = torch.cuda.device_count()
+        print(f"Using all {gpu_count} GPUs with tensor parallelism")
+        
+        llm = LLM(
+            model=args.model, 
+            dtype='bfloat16', 
+            max_model_len=20000,
+            tensor_parallel_size=gpu_count,
+            trust_remote_code=True
+        )
         # Set sampling parameters.
         sampling_params = SamplingParams(
             temperature=args.temperature,
@@ -186,24 +209,8 @@ def main():
     if args.sample_size:
         filtered_data = filtered_data[:args.sample_size]
     
-    # Process all models using parallel execution
-    # Set the number of workers based on model type - 4 for GPT, 8 for others
-    # Set workers based on model type - 4 for OpenAI, 1 for vLLM, 8 for others
+    # Process all models using parallel execution or batch processing for vLLM
     responses = []
-    
-    if not args.num_workers:
-        if is_openai_model:
-            max_workers = 4
-        elif is_claude_model:
-            max_workers = 2
-        elif is_deepseek_model:
-            max_workers = 32
-        elif model_type == "vllm":  # vLLM case (when model_type is not set)
-            max_workers = 1
-        else:
-            max_workers = 8
-    else:
-        max_workers = args.num_workers
     
     temperature = args.temperature
     if args.method == "base":
@@ -220,36 +227,64 @@ def main():
     
     print("Using method: ", args.method)
 
-    print(f"Processing requests in parallel with {max_workers} workers...")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Create a list of future tasks
-        future_to_entry = {
-            executor.submit(
-                method,
-                entry, 
-                args.model, 
-                args.max_tokens, 
-                temperature,
-                model_type,
-                llm,
-                sampling_params,
-                is_multimodal
-            ): entry for entry in filtered_data
-        }
-        
-        # Process results as they complete with tqdm for progress
-        for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(filtered_data)):
-            result = future.result()
-            if result:
-                # Add information about whether this question has an image
-                result["has_image"] = bool((result.get("image_path") and result["image_path"].strip()) or 
-                                          (result.get("image") and result["image"].strip()))
-                responses.append(result)
+    if model_type == "vllm":
+        # For vLLM, use batch processing for better throughput
+        print("Processing all requests in batch with vLLM...")
+        from utils.vllm_batch_processor import process_batch_vllm
+        responses = process_batch_vllm(
+            filtered_data, 
+            method,
+            args.model, 
+            args.max_tokens, 
+            temperature,
+            llm,
+            sampling_params,
+            is_multimodal
+        )
+    else:
+        # For API-based models, use parallel processing
+        if not args.num_workers:
+            if is_openai_model:
+                max_workers = 4
+            elif is_claude_model:
+                max_workers = 2
+            elif is_deepseek_model:
+                max_workers = 32
+            else:
+                max_workers = 8
+        else:
+            max_workers = args.num_workers
+            
+        print(f"Processing requests in parallel with {max_workers} workers...")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Create a list of future tasks
+            future_to_entry = {
+                executor.submit(
+                    method,
+                    entry, 
+                    args.model, 
+                    args.max_tokens, 
+                    temperature,
+                    model_type,
+                    llm,
+                    sampling_params,
+                    is_multimodal
+                ): entry for entry in filtered_data
+            }
+            
+            # Process results as they complete with tqdm for progress
+            for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(filtered_data)):
+                result = future.result()
+                if result:
+                    # Add information about whether this question has an image
+                    result["has_image"] = bool((result.get("image_path") and result["image_path"].strip()) or 
+                                              (result.get("image") and result["image"].strip()))
+                    responses.append(result)
 
     # Now handle the LLM-based judging in parallel for free response questions
     # print(predictions)
 
-    decisions = judge_responses(responses, max_workers=8, use_llm=args.llm_judge)
+    decisions = judge_responses(responses, max_workers=32, use_llm=args.llm_judge, use_rule=args.rule_judge)
     
     
 
@@ -257,9 +292,11 @@ def main():
     # Create a results directory in the same directory as the input file
     results_dir = args.output_dir
 
+    # Add timestamp to filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     os.makedirs(results_dir, exist_ok=True)  # Create the directory if it doesn't exist
-    csv_output_path = os.path.join(results_dir, f"{model_name}_{args.method}.csv")
+    csv_output_path = os.path.join(results_dir, f"{model_name}_{args.method}_{timestamp}.csv")
 
     
     # Before writing to CSV, ensure all dictionaries have a consistent set of keys

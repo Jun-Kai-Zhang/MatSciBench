@@ -11,6 +11,7 @@ import mimetypes
 from google import genai
 from google.genai import types
 
+
 def generate_with_api(model_type, model, conversation, max_tokens, temperature, image_paths=None):
     """Generate response using API with support for multiple images"""
     # Append datasets/ to the image paths if they don't already have it
@@ -23,6 +24,7 @@ def generate_with_api(model_type, model, conversation, max_tokens, temperature, 
             else:
                 processed_image_paths.append(path)
         image_paths = processed_image_paths
+    # print("image_paths: ", image_paths)
     if model_type == "openai":
         response = generate_with_openai(
             model,

@@ -1,3 +1,6 @@
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 import re
 import sys
 import threading
@@ -6,6 +9,7 @@ from io import StringIO
 import time
 
 from utils import generate_with_api, extract_final_answer
+from utils.vllm_api import generate_with_vllm
 from methods.prompts import TOOL_SYSTEM_PROMPT, TOOL_FINAL_ANSWER_PROMPT
 from utils.python_executor import PythonExecutor
 
@@ -54,9 +58,9 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
         #     print(f">> Generating response for question {qid}...", flush=True)
 
         if model_type == "vllm":  # vLLM model
-            output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-            full_output = output[0].outputs[0].text.strip()
-            new_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
+            full_output = response["text"].strip()
+            new_token_nums = response["token_ids"]
         else:
             full_output, new_token_nums = generate_with_api(
                 model_type,
@@ -93,10 +97,10 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
             full_output += "\n\n" + code_executed
             
             if model_type == "vllm":
-                followup_output = llm.chat(followup_conversation, sampling_params=sampling_params, use_tqdm=False)
-                followup_response = followup_output[0].outputs[0].text.strip()
+                followup_response_data = generate_with_vllm(llm, sampling_params, followup_conversation, image_paths)
+                followup_response = followup_response_data["text"].strip()
                 # Add tokens to the count
-                new_token_nums += len(followup_output[0].outputs[0].token_ids)
+                new_token_nums += followup_response_data["token_ids"]
             else:
                 followup_response, additional_tokens = generate_with_api(
                     model_type,

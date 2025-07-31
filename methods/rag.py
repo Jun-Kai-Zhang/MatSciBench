@@ -1,6 +1,7 @@
 import os
 from tavily import TavilyClient
 from utils import generate_with_api, extract_final_answer
+from utils.vllm_api import generate_with_vllm
 from methods.prompts import SYSTEM_PROMPT, RAG_QUERY_PROMPT, RAG_SUMMARY_PROMPT
 
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
@@ -38,9 +39,9 @@ def rag(entry, model, max_tokens, temperature, model_type, llm=None, sampling_pa
             {"role": "user", "content": query_prompt}
         ]
         if model_type == "vllm":
-            output = llm.chat(query_conversation, sampling_params=sampling_params, use_tqdm=False)
-            search_query = output[0].outputs[0].text.strip()
-            query_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, query_conversation, image_paths)
+            search_query = response["text"].strip()
+            query_token_nums = response["token_ids"]
         else:
             search_query, query_token_nums = generate_with_api(
                 model_type, model, query_conversation, max_tokens, temperature, image_paths
@@ -65,9 +66,9 @@ def rag(entry, model, max_tokens, temperature, model_type, llm=None, sampling_pa
             {"role": "user", "content": summary_prompt}
         ]
         if model_type == "vllm":
-            output = llm.chat(summary_conversation, sampling_params=sampling_params, use_tqdm=False)
-            summary = output[0].outputs[0].text.strip()
-            summary_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, summary_conversation, image_paths)
+            summary = response["text"].strip()
+            summary_token_nums = response["token_ids"]
         else:
             summary, summary_token_nums = generate_with_api(
                 model_type, model, summary_conversation, max_tokens, temperature, image_paths
@@ -88,9 +89,9 @@ def rag(entry, model, max_tokens, temperature, model_type, llm=None, sampling_pa
         ]
 
         if model_type == "vllm":
-            output = llm.chat(answer_conversation, sampling_params=sampling_params, use_tqdm=False)
-            full_output = output[0].outputs[0].text.strip()
-            answer_token_nums = len(output[0].outputs[0].token_ids)
+            response = generate_with_vllm(llm, sampling_params, answer_conversation, image_paths)
+            full_output = response["text"].strip()
+            answer_token_nums = response["token_ids"]
         else:
             full_output, answer_token_nums = generate_with_api(
                 model_type, model, answer_conversation, max_tokens, temperature, image_paths
@@ -101,7 +102,7 @@ def rag(entry, model, max_tokens, temperature, model_type, llm=None, sampling_pa
         return {
             "qid": entry.get("qid", ""),
             "question_type": entry["type"],
-            "question": question_text,
+            "question": augmented_question,
             "full_output": full_output,
             "final_answer": final_answer,
             "correct_solution": correct_solution,
