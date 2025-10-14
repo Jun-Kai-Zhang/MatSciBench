@@ -21,20 +21,21 @@ from evaluation.auto_judge import judge_responses
 # Define multimodal and text-only model lists
 MULTIMODAL_MODELS = [
     "gpt-4o", 
-    # "gpt-4.1",
+    "gpt-4.1",
     "o4-mini",
     "o3",
-
+    "gpt-5",
     "gemini-2.0-flash",
     "gemini-2.5-flash",
     "gemini-2.5-pro",
 
-    "claude-3-7", 
+    "claude-3-7-sonnet", 
     "claude-3-5", 
+    "claude-sonnet-4",
     
     "qwen2.5-vl-32b-instruct",
 
-    # "llama-4-maverick"
+    "llama-4-maverick-17b"
 ]
 
 # Other models are considered text-only by default
@@ -74,6 +75,8 @@ def parse_args():
                         help="Output directory for results.")
     parser.add_argument("--sample_size", type=int, default=None,
                         help="Number of samples to evaluate.")
+    parser.add_argument("--use_batch", action="store_true",
+                        help="Use batch processing for OpenAI and Anthropic models (50% cost reduction).")
     return parser.parse_args()
 
 
@@ -242,44 +245,103 @@ def main():
             is_multimodal
         )
     else:
-        # For API-based models, use parallel processing
-        if not args.num_workers:
-            if is_openai_model:
-                max_workers = 4
-            elif is_claude_model:
-                max_workers = 2
-            elif is_deepseek_model:
-                max_workers = 32
+        # For API-based models, use batch processing if enabled
+        if args.use_batch and (is_openai_model or is_claude_model):
+            print("Using batch processing for cost-effective evaluation...")
+
+            try:
+                # Special handling for tool augmentation method
+                if args.method == "tool":
+                    print("Using multi-round batch processing for tool augmentation...")
+                    from methods.tool_augmentation import tool_augmentation_batch
+
+                    if is_openai_model:
+                        model_type_for_batch = "openai"
+                    elif is_claude_model:
+                        model_type_for_batch = "anthropic"
+                    else:
+                        raise ValueError(f"Unsupported model type for batch tool augmentation: {args.model}")
+
+                    responses = tool_augmentation_batch(
+                        filtered_data,
+                        args.model,
+                        args.max_tokens,
+                        temperature,
+                        model_type_for_batch,
+                        is_multimodal
+                    )
+                else:
+                    # Use regular batch processing for other methods
+                    from utils.batch_processor import process_batch_openai, process_batch_claude
+
+                    if is_openai_model:
+                        responses = process_batch_openai(
+                            filtered_data,
+                            method,
+                            args.model,
+                            args.max_tokens,
+                            temperature,
+                            is_multimodal
+                        )
+                    elif is_claude_model:
+                        responses = process_batch_claude(
+                            filtered_data,
+                            method,
+                            args.model,
+                            args.max_tokens,
+                            temperature,
+                            is_multimodal
+                        )
+
+                # Add image information to responses
+                for response in responses:
+                    if 'has_image' not in response:
+                        response["has_image"] = bool((response.get("image_path") and response["image_path"].strip()) or
+                                                   (response.get("image") and response["image"].strip()))
+
+            except Exception as e:
+                print(f"Batch processing failed: {e}")
+                return  # Exit instead of falling back
+
+        if not args.use_batch or not (is_openai_model or is_claude_model):
+            # Use parallel processing for non-batch modes or unsupported models
+            if not args.num_workers:
+                if is_openai_model:
+                    max_workers = 4
+                elif is_claude_model:
+                    max_workers = 2
+                elif is_deepseek_model:
+                    max_workers = 32
+                else:
+                    max_workers = 8
             else:
-                max_workers = 8
-        else:
-            max_workers = args.num_workers
-            
-        print(f"Processing requests in parallel with {max_workers} workers...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Create a list of future tasks
-            future_to_entry = {
-                executor.submit(
-                    method,
-                    entry, 
-                    args.model, 
-                    args.max_tokens, 
-                    temperature,
-                    model_type,
-                    llm,
-                    sampling_params,
-                    is_multimodal
-                ): entry for entry in filtered_data
-            }
-            
-            # Process results as they complete with tqdm for progress
-            for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(filtered_data)):
-                result = future.result()
-                if result:
-                    # Add information about whether this question has an image
-                    result["has_image"] = bool((result.get("image_path") and result["image_path"].strip()) or 
-                                              (result.get("image") and result["image"].strip()))
-                    responses.append(result)
+                max_workers = args.num_workers
+
+            print(f"Processing requests in parallel with {max_workers} workers...")
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Create a list of future tasks
+                future_to_entry = {
+                    executor.submit(
+                        method,
+                        entry,
+                        args.model,
+                        args.max_tokens,
+                        temperature,
+                        model_type,
+                        llm,
+                        sampling_params,
+                        is_multimodal
+                    ): entry for entry in filtered_data
+                }
+
+                # Process results as they complete with tqdm for progress
+                for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(filtered_data)):
+                    result = future.result()
+                    if result:
+                        # Add information about whether this question has an image
+                        result["has_image"] = bool((result.get("image_path") and result["image_path"].strip()) or
+                                                  (result.get("image") and result["image"].strip()))
+                        responses.append(result)
 
     # Now handle the LLM-based judging in parallel for free response questions
     # print(predictions)
@@ -317,7 +379,17 @@ def main():
             writer = csv.DictWriter(f, fieldnames=list(all_keys))
             writer.writeheader()
             writer.writerows(decisions)
-    print(f"Saved responses and decisions to {csv_output_path}")
+        print(f"Saved responses and decisions to {csv_output_path}")
+    else:
+        # No decisions were produced, so no file will be created.
+        # Provide a helpful message to the user instead of a misleading save path.
+        num_responses = len(responses) if isinstance(responses, list) else 0
+        print(
+            "Warning: No decisions were generated; CSV not written. "
+            f"responses={num_responses}, decisions=0. "
+            "If you used batch mode, results may not have been retrieved correctly. "
+            "Try running without --use_batch, verify API keys, or check batch result fetching."
+        )
     
 
 

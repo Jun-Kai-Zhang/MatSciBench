@@ -16,6 +16,55 @@ from utils.python_executor import PythonExecutor
 # Add a threading lock for synchronized printing
 print_lock = threading.Lock()
 
+def prepare_prompt(entry, is_multimodal=False):
+    """Prepare the prompt for batch processing (Round 1 only)"""
+    question_text = entry["question"]
+    if entry["unit"].strip() != "":
+        if entry["number_of_answers"] == "single":
+            question_text += f"The unit of the answer is {entry['unit']}."
+        elif entry["number_of_answers"] == "multiple":
+            question_text += f"The units of each required answer are {entry['unit']}, respectively."
+        else:
+            raise ValueError(f"Invalid number of answers: {entry['number_of_answers']}")
+
+    conversation = [
+        {"role": "system", "content": TOOL_SYSTEM_PROMPT},
+        {"role": "user", "content": question_text}
+    ]
+
+    return {"messages": conversation}
+
+def tool_augmentation_batch(data_list, model, max_tokens, temperature, model_type, is_multimodal=False):
+    """
+    Batch version of tool augmentation using multi-round batch processing.
+
+    Args:
+        data_list: List of question entries to process
+        model: Model name
+        max_tokens: Maximum tokens per request
+        temperature: Sampling temperature
+        model_type: Type of model ("openai", "anthropic", "vllm")
+        is_multimodal: Whether the model supports images
+
+    Returns:
+        List of processed results
+    """
+    if model_type == "vllm":
+        # vLLM doesn't support batch processing, fall back to individual processing
+        results = []
+        for entry in data_list:
+            result = tool_augmentation(entry, model, max_tokens, temperature, model_type,
+                                     llm=None, sampling_params=None, is_multimodal=is_multimodal)
+            results.append(result)
+        return results
+
+    # Use multi-round batch processing for API models
+    from utils.multi_round_batch_processor import run_multi_round_batch_tool_augmentation
+
+    return run_multi_round_batch_tool_augmentation(
+        data_list, model, max_tokens, temperature, model_type, is_multimodal
+    )
+
 def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
     """Tool augmentation is a method that wrte python code to augment the model's ability to solve problems."""
     try:

@@ -6,6 +6,26 @@ from methods.prompts import SYSTEM_PROMPT, RAG_QUERY_PROMPT, RAG_SUMMARY_PROMPT
 
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+def prepare_prompt(entry, is_multimodal=False):
+    """Prepare the prompt for batch processing"""
+    question_text = entry["question"]
+    if entry["unit"].strip() != "":
+        if entry["number_of_answers"] == "single":
+            question_text += f"The unit of the answer is {entry['unit']}."
+        elif entry["number_of_answers"] == "multiple":
+            question_text += f"The units of each required answer are {entry['unit']}, respectively."
+        else:
+            raise ValueError(f"Invalid number of answers: {entry['number_of_answers']}")
+
+    # For RAG, we would need to retrieve context here
+    # For now, just return the basic prompt structure
+    conversation = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question_text}
+    ]
+
+    return {"messages": conversation}
+
 
 
 

@@ -151,18 +151,62 @@ def generate_with_claude(model, conversation, max_tokens, temperature, image_pat
         
         # Create Claude client and generate response
         client = anthropic.Anthropic(api_key=anthropic.api_key)
-        response = client.messages.create(
-            model=model,
-            system=system_content,  # Pass system prompt here
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature
-        )
-        
-        return {
-            "text": response.content[0].text,
-            "token_ids": response.usage.output_tokens
+
+        # Configure extended thinking for Claude Sonnet 4
+        api_params = {
+            "model": model,
+            "system": system_content,  # Pass system prompt here
+            "messages": messages,
+            "temperature": temperature
         }
+
+        # Enable extended thinking for Claude Sonnet 4 models
+        if "claude" in model.lower() and "4" in model:
+            # Set thinking budget to max_tokens and total output to double of max_tokens
+            api_params["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": max_tokens
+            }
+            api_params["max_tokens"] = max_tokens * 2  # Double the max_tokens for total output
+            api_params["temperature"] = 1  # Temperature must be 1 for extended thinking
+        else:
+            api_params["max_tokens"] = max_tokens
+
+        response = client.messages.create(**api_params)
+        
+        # Handle extended thinking response format for Claude 4 models
+        if "claude" in model.lower() and "4" in model:
+            # Extract thinking content and final response
+            full_text = ""
+            thinking_content = ""
+            final_response = ""
+
+            for content_block in response.content:
+                if hasattr(content_block, 'type'):
+                    if content_block.type == 'thinking':
+                        thinking_content = getattr(content_block, 'content', '') or getattr(content_block, 'text', '')
+                    elif content_block.type == 'text':
+                        final_response = getattr(content_block, 'content', '') or getattr(content_block, 'text', '')
+                else:
+                    # Fallback for different response format
+                    final_response = getattr(content_block, 'text', '') or getattr(content_block, 'content', '') or str(content_block)
+
+            # Combine thinking and final response
+            if thinking_content:
+                full_text = f"<thinking>\n{thinking_content}\n</thinking>\n\n{final_response}"
+            else:
+                full_text = final_response
+
+            return {
+                "text": full_text,
+                "token_ids": response.usage.output_tokens
+            }
+        else:
+            # Standard response format for non-Claude-4 models
+            return {
+                "text": response.content[0].text,
+                "token_ids": response.usage.output_tokens
+            }
     except Exception as e:
         print(f"Error with Claude API: {e}")
         return {"text": "", "token_ids": 0}
@@ -414,13 +458,18 @@ def generate_with_openai(model, conversation, max_tokens, temperature, image_pat
             else:
                 messages.append(msg)
         
-        # Make the API call - handle newer o3/o1 models differently
-        if model.startswith("o4-") or model.startswith("o3-") or model.startswith("o1-"):
-            response = openai.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_completion_tokens=max_tokens,  # Use max_completion_tokens for o3/o1 models
-            )
+        # Make the API call - handle newer o4/o3/o1/gpt-5 models differently
+        if model.startswith("o4-") or model.startswith("o3-") or model.startswith("o1-") or model.startswith("gpt-5"):
+            # Use max_completion_tokens for these models
+            params = {
+                "model": model,
+                "messages": messages,
+                "max_completion_tokens": max_tokens,
+            }
+            # Only include temperature for o4 models, omit for o1/o3/gpt-5 to use defaults
+            if model.startswith("o4-"):
+                params["temperature"] = temperature
+            response = openai.chat.completions.create(**params)
         else:
             response = openai.chat.completions.create(
                 model=model,

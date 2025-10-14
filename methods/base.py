@@ -3,6 +3,24 @@ from utils.vllm_api import generate_with_vllm
 
 from methods.prompts import SYSTEM_PROMPT
 
+def prepare_prompt(entry, is_multimodal=False):
+    """Prepare the prompt for batch processing"""
+    question_text = entry["question"]
+    if entry["unit"].strip() != "":
+        if entry["number_of_answers"] == "single":
+            question_text += f"The unit of the answer is {entry['unit']}."
+        elif entry["number_of_answers"] == "multiple":
+            question_text += f"The units of each required answer are {entry['unit']}, respectively."
+        else:
+            raise ValueError(f"Invalid number of answers: {entry['number_of_answers']}")
+
+    conversation = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": question_text}
+    ]
+
+    return {"messages": conversation}
+
 
 
 def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):

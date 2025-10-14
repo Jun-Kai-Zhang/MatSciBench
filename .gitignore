@@ -9,3 +9,4 @@
 .DS_Store
 results/
 
+*/__pycache__/*
