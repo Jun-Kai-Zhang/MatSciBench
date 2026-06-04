@@ -16,7 +16,7 @@ from evaluation.model_registry import (
     get_model_config,
     multimodal_model_names,
 )
-from utils.eval_data import DEFAULT_DATASET, DEFAULT_SPLIT, load_eval_data
+from utils.eval_data import load_eval_data
 from utils.image_inputs import image_count
 
 
@@ -34,18 +34,6 @@ MULTIMODAL_MODELS = multimodal_model_names()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run MatSciBench evaluation.")
-    parser.add_argument(
-        "--dataset",
-        type=str,
-        default=DEFAULT_DATASET,
-        help="Hugging Face dataset repo id to evaluate.",
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default=DEFAULT_SPLIT,
-        help="Dataset split to evaluate.",
-    )
     parser.add_argument(
         "--model",
         type=str,
@@ -195,12 +183,12 @@ def main():
         return
 
     try:
-        data = load_eval_data(args.dataset, args.split)
+        data = load_eval_data()
     except Exception as exc:
-        print(f"Error loading dataset {args.dataset} split {args.split}: {exc}")
+        print(f"Error loading MatSciBench dataset: {exc}")
         return
 
-    print(f"Loaded {len(data)} questions from {args.dataset}/{args.split}.")
+    print(f"Loaded {len(data)} questions from MatSciBench.")
     filtered_data = filter_data(data, args.method, model_config.multimodal)
     if args.sample_size is not None:
         filtered_data = filtered_data[:args.sample_size]
@@ -225,8 +213,6 @@ def main():
     )
 
     for response in responses:
-        response["dataset"] = args.dataset
-        response["split"] = args.split
         response["model"] = args.model
 
     from evaluation.auto_judge import judge_responses
