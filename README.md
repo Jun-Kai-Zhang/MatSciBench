@@ -70,26 +70,7 @@ Important columns include:
 - `primary_category` and topic columns: domain annotations
 - `source` and `original_qid`: source metadata
 
-You can also evaluate a local parquet file:
-
-```bash
-python evaluation/eval.py \
-  --dataset /path/to/MatSciBench.parquet \
-  --model gemini-2.5-flash \
-  --method base
-```
-
 ## Running Evaluation
-
-Run a small smoke test first:
-
-```bash
-python evaluation/eval.py \
-  --model gemini-2.5-flash \
-  --method base \
-  --sample_size 20 \
-  --num_workers 4
-```
 
 Run the full benchmark with optional LLM judging for formula answers:
 
