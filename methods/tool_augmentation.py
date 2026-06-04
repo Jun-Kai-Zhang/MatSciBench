@@ -2,14 +2,11 @@ import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import re
-import sys
 import threading
 import traceback  # Added for detailed error reporting
-from io import StringIO
-import time
 
 from utils import generate_with_api, extract_final_answer
-from utils.vllm_api import generate_with_vllm
+from utils.image_inputs import entry_images, image_count, image_summary
 from methods.prompts import TOOL_SYSTEM_PROMPT, TOOL_FINAL_ANSWER_PROMPT
 from utils.python_executor import PythonExecutor
 
@@ -34,38 +31,7 @@ def prepare_prompt(entry, is_multimodal=False):
 
     return {"messages": conversation}
 
-def tool_augmentation_batch(data_list, model, max_tokens, temperature, model_type, is_multimodal=False):
-    """
-    Batch version of tool augmentation using multi-round batch processing.
-
-    Args:
-        data_list: List of question entries to process
-        model: Model name
-        max_tokens: Maximum tokens per request
-        temperature: Sampling temperature
-        model_type: Type of model ("openai", "anthropic", "vllm")
-        is_multimodal: Whether the model supports images
-
-    Returns:
-        List of processed results
-    """
-    if model_type == "vllm":
-        # vLLM doesn't support batch processing, fall back to individual processing
-        results = []
-        for entry in data_list:
-            result = tool_augmentation(entry, model, max_tokens, temperature, model_type,
-                                     llm=None, sampling_params=None, is_multimodal=is_multimodal)
-            results.append(result)
-        return results
-
-    # Use multi-round batch processing for API models
-    from utils.multi_round_batch_processor import run_multi_round_batch_tool_augmentation
-
-    return run_multi_round_batch_tool_augmentation(
-        data_list, model, max_tokens, temperature, model_type, is_multimodal
-    )
-
-def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
+def tool_augmentation(entry, model, max_tokens, temperature, is_multimodal=False):
     """Tool augmentation is a method that wrte python code to augment the model's ability to solve problems."""
     try:
         qid = entry.get('qid', 'unknown')
@@ -85,18 +51,13 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
         correct = str(entry["answer"]).strip() if entry["answer"] is not None else ""
         domain = entry.get("domain", "")
         correct_solution = entry.get("solution", "")
-        image_path_raw = entry.get("image", "").strip()
+        images = entry_images(entry)
         number_of_answers = entry.get("number_of_answers", "")
         unit = entry.get("unit", "")
-        # Parse multiple image paths if present (comma-separated)
-        image_paths = []
-        if image_path_raw and image_path_raw.lower() != "nan":
-            # Split by comma and strip whitespace from each path
-            image_paths = [path.strip() for path in image_path_raw.split(',') if path.strip()]
         
         # Only pass images if the model is multimodal
         if not is_multimodal:
-            image_paths = []
+            images = []
             
         conversation = [
             {"role": "system", "content": TOOL_SYSTEM_PROMPT},
@@ -106,19 +67,13 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
         # with print_lock:
         #     print(f">> Generating response for question {qid}...", flush=True)
 
-        if model_type == "vllm":  # vLLM model
-            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
-            full_output = response["text"].strip()
-            new_token_nums = response["token_ids"]
-        else:
-            full_output, new_token_nums = generate_with_api(
-                model_type,
-                model,
-                conversation,
-                max_tokens,
-                temperature,
-                image_paths
-            )
+        full_output, new_token_nums = generate_with_api(
+            model,
+            conversation,
+            max_tokens,
+            temperature,
+            images
+        )
             
         # with print_lock:
         #     print(f">> Executing code for question {qid}...", flush=True)
@@ -145,21 +100,14 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
             full_output += "\n\n" + "-" * 60
             full_output += "\n\n" + code_executed
             
-            if model_type == "vllm":
-                followup_response_data = generate_with_vllm(llm, sampling_params, followup_conversation, image_paths)
-                followup_response = followup_response_data["text"].strip()
-                # Add tokens to the count
-                new_token_nums += followup_response_data["token_ids"]
-            else:
-                followup_response, additional_tokens = generate_with_api(
-                    model_type,
-                    model,
-                    followup_conversation,
-                    max_tokens,
-                    temperature,
-                    image_paths
-                )
-                new_token_nums += additional_tokens
+            followup_response, additional_tokens = generate_with_api(
+                model,
+                followup_conversation,
+                max_tokens,
+                temperature,
+                images
+            )
+            new_token_nums += additional_tokens
                 
             final_answer = extract_final_answer(followup_response)
             full_output += "\n\n" + "-" * 60
@@ -186,7 +134,8 @@ def tool_augmentation(entry, model, max_tokens, temperature, model_type, llm=Non
             "number_of_answers": number_of_answers,
             "domain": domain,
             "new_token_nums": new_token_nums,
-            "image": image_path_raw
+            "image": image_summary(entry),
+            "image_count": image_count(entry),
         }
     
     except Exception as err:

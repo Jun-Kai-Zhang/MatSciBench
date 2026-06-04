@@ -1,5 +1,5 @@
 from utils import generate_with_api, extract_final_answer
-from utils.vllm_api import generate_with_vllm
+from utils.image_inputs import entry_images, image_count, image_summary
 from methods.prompts import SYSTEM_PROMPT
 from collections import Counter
 
@@ -21,7 +21,7 @@ def prepare_prompt(entry, is_multimodal=False):
 
     return {"messages": conversation}
 
-def self_consistency(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False, n_samples=4):
+def self_consistency(entry, model, max_tokens, temperature, is_multimodal=False, n_samples=4):
     """
     Implements self-consistency method using majority voting.
     Generates multiple responses for the same prompt and selects the most frequent answer.
@@ -40,18 +40,13 @@ def self_consistency(entry, model, max_tokens, temperature, model_type, llm=None
         correct = str(entry["answer"]).strip() if entry["answer"] is not None else ""
         domain = entry.get("domain", "")
         correct_solution = entry.get("solution", "")
-        image_path_raw = entry.get("image", "").strip()
+        images = entry_images(entry)
         number_of_answers = entry.get("number_of_answers", "")
         unit = entry.get("unit", "")
-        # Parse multiple image paths if present (comma-separated)
-        image_paths = []
-        if image_path_raw and image_path_raw.lower() != "nan":
-            # Split by comma and strip whitespace from each path
-            image_paths = [path.strip() for path in image_path_raw.split(',') if path.strip()]
         
         # Only pass images if the model is multimodal
         if not is_multimodal:
-            image_paths = []
+            images = []
         
         # Use Chain-of-Thought system prompt for better reasoning
         conversation = [
@@ -65,29 +60,13 @@ def self_consistency(entry, model, max_tokens, temperature, model_type, llm=None
         total_tokens = 0
         
         for _ in range(n_samples):
-            # Set a non-zero temperature to ensure diversity in the samples
-            
-            if model_type == "vllm":  # vLLM model
-                # Create a modified sampling params with higher temperature
-                modified_params = sampling_params
-                if hasattr(sampling_params, '_asdict'):  # If it's a namedtuple
-                    params_dict = sampling_params._asdict()
-                    params_dict['temperature'] = temperature
-                    from vllm import SamplingParams
-                    modified_params = SamplingParams(**params_dict)
-                
-                response = generate_with_vllm(llm, modified_params, conversation, image_paths)
-                full_output = response["text"].strip()
-                tokens = response["token_ids"]
-            else:
-                full_output, tokens = generate_with_api(
-                    model_type,
-                    model,
-                    conversation,
-                    max_tokens,
-                    temperature,
-                    image_paths
-                )
+            full_output, tokens = generate_with_api(
+                model,
+                conversation,
+                max_tokens,
+                temperature,
+                images
+            )
             
             outputs.append(full_output)
             final_answer = extract_final_answer(full_output)
@@ -121,10 +100,10 @@ def self_consistency(entry, model, max_tokens, temperature, model_type, llm=None
             "new_token_nums": total_tokens,
             "all_answers": answers,
             "sc_majority": majority_answer,
-            "image": image_path_raw
+            "image": image_summary(entry),
+            "image_count": image_count(entry),
         }
     
     except Exception as err:
         print(f"Error processing question {entry.get('qid', 'unknown')}: {err}")
         return None
-

@@ -1,50 +1,73 @@
 import concurrent.futures
 from tqdm import tqdm
-import google.generativeai as genai
-import os
 import re
-import signal
-import time
-import psutil
 import multiprocessing
+import openai
 from evaluation.prompts import JUDGE_SYSTEM_PROMPT, JUDGE_USER_PROMPT
-from utils import extract_final_answer, extract_number, generate_with_api
 from evaluation.grader import math_equal
+from evaluation.model_registry import FORMULA_JUDGE_MODEL, get_api_key, get_model_config
+from evaluation.rule_judge import judge_num_answer
 
 
-def judge_response_with_gemini(model_answer, correct_answer, question, api_key):
-    """Use Gemini to judge if a response is correct"""
+def extract_final_answer(response: str) -> str:
+    if not response:
+        return ""
+
+    matches = list(re.finditer(r"(?:\\)?boxed\s*\{", response))
+    if not matches:
+        return ""
+
+    start_index = matches[-1].end()
+    brace_count = 1
+    end_index = start_index
+    while brace_count > 0 and end_index < len(response):
+        if response[end_index] == "{":
+            brace_count += 1
+        elif response[end_index] == "}":
+            brace_count -= 1
+        end_index += 1
+
+    if brace_count > 0:
+        return ""
+    return response[start_index:end_index - 1].strip()
+
+
+def judge_response_with_llm(model_answer, correct_answer, question):
+    """Use the configured formula judge model to judge if a response is correct."""
     # If the model answer is empty, return incorrect directly
     if not model_answer or model_answer.strip() == "":
         return {"is_correct": False, "judge_reasoning": "Model answer is empty."}
     
     try:
-        # Configure API key locally for this function to be thread-safe
-        if not api_key:
-            api_key = os.environ.get("GEMINI_API_KEY", None)
-        if not api_key:
-            print("Warning: No Gemini API key available for judging questions.")
-            return {"is_correct": False, "judge_reasoning": "No Gemini API key available."}
-        genai.configure(api_key=api_key)
-        model = "gemini-2.5-flash-lite"
+        config = get_model_config(FORMULA_JUDGE_MODEL)
+        client = openai.OpenAI(
+            api_key=get_api_key(config),
+            base_url=config.endpoint_url,
+            timeout=600,
+        )
         
-        conversation = [
+        messages = [
             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
             {"role": "user", "content": JUDGE_USER_PROMPT.format(question=question, correct_answer=correct_answer, model_answer=model_answer)}
         ]
-        
-        response, _ = generate_with_api("gemini", model, conversation, 4096, 0.0, [])
+        response = client.chat.completions.create(
+            model=config.model_name,
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.0,
+        )
+        response_text = response.choices[0].message.content or ""
 
         # Extract the decision from the LaTeX box
-        decision = extract_final_answer(response).lower()
+        decision = extract_final_answer(response_text).lower()
         # Check if the decision is "correct"
         # Clean up the decision by removing extra spaces and normalizing
         decision = decision.strip().replace('"', '')
         # Check if the decision is "correct"
-        return {"is_correct": decision == "correct", "judge_reasoning": response}
+        return {"is_correct": decision == "correct", "judge_reasoning": response_text}
     
     except Exception as e:
-        print(f"Error using Gemini to judge question: {e}")
+        print(f"Error using LLM judge for question: {e}")
         return {"is_correct": False, "judge_reasoning": f"Error: {str(e)}"}
 
 
@@ -82,7 +105,7 @@ def _rule_judge_worker(model_answer, correct_answer, multiple):
             all_correct = True
             incorrect_answers = []
             for i, (m_ans, c_ans) in enumerate(zip(model_answers, correct_answers)):
-                if not math_equal(m_ans, c_ans):
+                if not math_equal(m_ans, c_ans, include_percentage=False, timeout=True):
                     all_correct = False
                     incorrect_answers.append(f"Answer #{i+1}: {m_ans} ≠ {c_ans}")
             
@@ -97,7 +120,7 @@ def _rule_judge_worker(model_answer, correct_answer, multiple):
         # If not multiple, just use math_equal directly
         model_answer = normalize_scientific_notation(model_answer)
         correct_answer = normalize_scientific_notation(correct_answer)
-        is_correct = math_equal(model_answer, correct_answer)
+        is_correct = math_equal(model_answer, correct_answer, include_percentage=False, timeout=True)
         if is_correct:
             return {"is_correct": True, "judge_reasoning": f"Answer: {model_answer} = {correct_answer}"}
         else:
@@ -183,12 +206,13 @@ def normalize_scientific_notation(answer_str):
         if re.search(r'^[+-]?\d+\.?\d*[eE][+-]?\d+$', answer_str):
             return str(float(answer_str))
             
-        # Case 2: Super flexible scientific notation matcher
-        # Just look for a number followed by 10^ and another number
-        scientific_pattern = r'(\d+\.?\d*)(?:.*?)10\^{?([+-]?\d+)}?'
+        # Case 2: Super flexible scientific notation matcher.
+        # Preserve the coefficient sign; otherwise "-8.6 x 10^-9" is
+        # incorrectly normalized as a positive value.
+        scientific_pattern = r'([+-]?\s*\d+\.?\d*)(?:.*?)(?:10)\^{?([+-]?\d+)}?'
         match = re.search(scientific_pattern, answer_str)
         if match:
-            coefficient = float(match.group(1))
+            coefficient = float(match.group(1).replace(" ", ""))
             exponent = int(match.group(2))
             # Convert to a float and then to string
             return str(coefficient * (10 ** exponent))
@@ -200,54 +224,57 @@ def normalize_scientific_notation(answer_str):
         return answer_str
 
 
-def judge_single_response(pred, gemini_api_key=None, use_llm=True, use_rule=True, rule_timeout=20):
-    """Judge if a response is correct"""
+def judge_single_response(pred, use_llm_formula=False, rule_timeout=20):
+    """Judge one prediction.
+
+    The rule judge always runs. The LLM judge runs only for FORMULA questions
+    when use_llm_formula is true. NUM final correctness always comes from the
+    rule judge.
+    """
     # Initialize variables
     judge_result_rule = None
     judge_result_llm = None
+    is_num_question = str(pred.get("question_type", "")).upper() == "NUM"
+    is_formula_question = str(pred.get("question_type", "")).upper() == "FORMULA"
     
-    # Run rule-based judging if enabled
-    if use_rule:
-        judge_result_rule = judge_response_with_rule(pred["final_answer"], pred["correct_answer"], 
-                                                   pred.get("multiple", False), timeout=rule_timeout)
-        # Store the rule-based judgment in separate fields
-        pred["rule_is_correct"] = judge_result_rule["is_correct"]
-        pred["rule_judge_reasoning"] = judge_result_rule["judge_reasoning"]
+    if is_num_question:
+        multiple = (
+            bool(pred.get("multiple", False))
+            or str(pred.get("number_of_answers", "")).lower() == "multiple"
+        )
+        judge_result_rule = judge_num_answer(pred["final_answer"], pred["correct_answer"], multiple)
+    else:
+        judge_result_rule = judge_response_with_rule(
+            pred["final_answer"],
+            pred["correct_answer"],
+            pred.get("multiple", False),
+            timeout=rule_timeout,
+        )
+    pred["rule_is_correct"] = judge_result_rule["is_correct"]
+    pred["rule_judge_reasoning"] = judge_result_rule["judge_reasoning"]
     
-    # Check if this is a formula question for special handling
-    is_formula_question = pred.get("question_type", "").upper() == "FORMULA"
-    
-    # Run LLM judging if enabled (for all question types when requested)
-    if use_llm:
-        judge_result_llm = judge_response_with_gemini(pred["final_answer"], pred["correct_answer"], pred["question"], gemini_api_key)
-        # Store the LLM judgment in separate fields
+    if use_llm_formula and is_formula_question:
+        judge_result_llm = judge_response_with_llm(pred["final_answer"], pred["correct_answer"], pred["question"])
         pred["llm_is_correct"] = judge_result_llm["is_correct"]
         pred["llm_judge_reasoning"] = judge_result_llm["judge_reasoning"]
     
     # Determine final judgment based on what's available
-    if judge_result_llm and judge_result_rule:
-        # Both available - prefer LLM for formula questions
+    if is_num_question:
+        pred["is_correct"] = judge_result_rule["is_correct"]
+        pred["judge_reasoning"] = f"Rule (NUM): {judge_result_rule['judge_reasoning']}"
+    elif judge_result_llm:
         if not judge_result_llm.get("judge_reasoning") or judge_result_llm.get("judge_reasoning", "").strip() == "":
             pred["is_correct"] = judge_result_rule["is_correct"]
             pred["judge_reasoning"] = f"LLM response was empty. Using rule-based judgment: {judge_result_rule['judge_reasoning']}"
         else:
             pred["is_correct"] = judge_result_llm["is_correct"]
             pred["judge_reasoning"] = f"LLM: {judge_result_llm['judge_reasoning']}\nRule: {judge_result_rule['judge_reasoning']}"
-    elif judge_result_llm:
-        # Only LLM available
-        pred["is_correct"] = judge_result_llm["is_correct"]
-        pred["judge_reasoning"] = f"LLM: {judge_result_llm['judge_reasoning']}"
-    elif judge_result_rule:
-        # Only rule available
+    else:
         pred["is_correct"] = judge_result_rule["is_correct"]
         if is_formula_question:
             pred["judge_reasoning"] = f"Rule (formula): {judge_result_rule['judge_reasoning']}"
         else:
             pred["judge_reasoning"] = f"Rule: {judge_result_rule['judge_reasoning']}"
-    else:
-        # Neither available - should not happen if validation is correct
-        pred["is_correct"] = False
-        pred["judge_reasoning"] = "Error: No judging method available"
 
     # Preserve the error field if it exists
     if "error" in pred:
@@ -257,7 +284,7 @@ def judge_single_response(pred, gemini_api_key=None, use_llm=True, use_rule=True
 
     return pred
 
-def judge_responses(predictions, gemini_api_key=None, max_workers=64, use_llm=True, use_rule=True, rule_timeout=240):
+def judge_responses(predictions, max_workers=64, use_llm_formula=False, rule_timeout=240):
     """Process all judgments in parallel"""
     
     # First, process all final answers
@@ -265,21 +292,10 @@ def judge_responses(predictions, gemini_api_key=None, max_workers=64, use_llm=Tr
         # Submit judging tasks for final answers
         future_to_index = {}
         for i, pred in enumerate(predictions):
-            # If the model answer is empty, mark as incorrect directly without API call
-            if not pred.get("final_answer") or pred.get("final_answer", "").strip() == "":
-                predictions[i]["is_correct"] = False
-                predictions[i]["judge_reasoning"] = "Model answer is empty."
-                # Preserve error field if it exists
-                if "error" in pred:
-                    predictions[i]["error"] = pred["error"]
-                continue
-                
             future = executor.submit(
                 judge_single_response,
                 pred,
-                gemini_api_key,
-                use_llm,
-                use_rule,
+                use_llm_formula,
                 rule_timeout
             )
             future_to_index[future] = i
@@ -316,9 +332,7 @@ def judge_responses(predictions, gemini_api_key=None, max_workers=64, use_llm=Tr
                 future = executor.submit(
                     judge_single_response,
                     temp_pred,
-                    gemini_api_key,
-                    use_llm,
-                    use_rule,
+                    use_llm_formula,
                     rule_timeout
                 )
                 future_to_index[future] = i

@@ -1,396 +1,264 @@
 import argparse
+import concurrent.futures
+import csv
+import importlib
 import os
-os.environ["VLLM_CACHE_ROOT"] = "/tmp/vllm_cache"
-os.environ["TORCH_COMPILE_DISABLE"] = "1"
-os.environ["TOKENIZERS_PARALLELISM"] = "false"
-import re
-import csv  # Add CSV import
-from tqdm import tqdm
 from datetime import datetime
 
-import openai
-import google.generativeai as genai
-import anthropic
-import concurrent.futures  # Add this import for parallel processing
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# Update this line to import all methods from the methods package
-from methods import base, tool_augmentation, self_correction, self_consistency, rag
-from evaluation.auto_judge import judge_responses
+from tqdm import tqdm
+
+from evaluation.model_registry import (
+    FORMULA_JUDGE_MODEL,
+    configure_openai_compatible_client,
+    get_api_key,
+    get_model_config,
+    multimodal_model_names,
+)
+from utils.eval_data import DEFAULT_DATASET, DEFAULT_SPLIT, load_eval_data
+from utils.image_inputs import image_count
 
 
-# Define multimodal and text-only model lists
-MULTIMODAL_MODELS = [
-    "gpt-4o", 
-    "gpt-4.1",
-    "o4-mini",
-    "o3",
-    "gpt-5",
-    "gemini-2.0-flash",
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
+METHOD_NAMES = ("base", "tool", "correction", "consistency")
+METHOD_IMPORTS = {
+    "base": ("methods.base", "base"),
+    "tool": ("methods.tool_augmentation", "tool_augmentation"),
+    "correction": ("methods.self_correction", "self_correction"),
+    "consistency": ("methods.self_consistency", "self_consistency"),
+}
 
-    "claude-3-7-sonnet", 
-    "claude-3-5", 
-    "claude-sonnet-4",
-    
-    "qwen2.5-vl-32b-instruct",
+# Kept for analysis scripts that import this symbol.
+MULTIMODAL_MODELS = multimodal_model_names()
 
-    "llama-4-maverick-17b"
-]
-
-# Other models are considered text-only by default
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run QA evaluation.")
-    parser.add_argument("--input", type=str, default="datasets/MatSciBench/qa.csv",
-                        help="Path to the input CSV file containing the QA dataset.")
-    parser.add_argument("--model", type=str, default="gemini-2.0-flash",
-                        help="Model name to use with vLLM.")
-    parser.add_argument("--temperature", type=float, default=0.0,
-                        help="Temperature for sampling (use 0.0 for deterministic output).")
-    parser.add_argument("--max_tokens", type=int, default=8192,
-                        help="Maximum number of tokens to generate.")
-    parser.add_argument("--method", type=str, default="base",
-                        choices=["base", "tool", "correction", "consistency", "rag"], 
-                        help="Methods to use for solving questions.")
-    parser.add_argument("--gpt_api_key", type=str, default=None,
-                        help="OpenAI API key (will use OPENAI_API_KEY env var if not provided).")
-    parser.add_argument("--gemini_api_key", type=str, default=None,
-                        help="Gemini API key (will use GEMINI_API_KEY env var if not provided).")
-    parser.add_argument("--claude_api_key", type=str, default=None,
-                        help="Claude API key (will use ANTHROPIC_API_KEY env var if not provided).")
-    parser.add_argument("--deepseek_api_key", type=str, default=None,
-                        help="DeepSeek API key (will use DEEPSEEK_API_KEY env var if not provided).")
-    parser.add_argument("--qwen_api_key", type=str, default=None,
-                        help="Qwen API key (will use QWEN_API_KEY env var if not provided).")
-    parser.add_argument("--lambda_api_key", type=str, default=None,
-                        help="Lambda API key (will use LAMBDA_API_KEY env var if not provided).")
-    parser.add_argument("--llm_judge", action="store_true",
-                        help="Use LLM to judge the correctness of the answer.")
-    parser.add_argument("--rule_judge", action="store_true",
-                        help="Use rule-based judging for correctness of the answer.")
-    parser.add_argument("--num_workers", type=int, default=None,
-                        help="Number of workers to use for parallel processing.")
-    parser.add_argument("--output_dir", type=str, default="results/evaluation",
-                        help="Output directory for results.")
-    parser.add_argument("--sample_size", type=int, default=None,
-                        help="Number of samples to evaluate.")
-    parser.add_argument("--use_batch", action="store_true",
-                        help="Use batch processing for OpenAI and Anthropic models (50% cost reduction).")
+    parser = argparse.ArgumentParser(description="Run MatSciBench evaluation.")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=DEFAULT_DATASET,
+        help="Hugging Face dataset repo id to evaluate.",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=DEFAULT_SPLIT,
+        help="Dataset split to evaluate.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="gemini-2.5-flash",
+        help="Model registry key from evaluation/model_registry.py.",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature.",
+    )
+    parser.add_argument(
+        "--max_tokens",
+        type=int,
+        default=8192,
+        help="Maximum tokens to generate.",
+    )
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="base",
+        choices=METHOD_NAMES,
+        help="Prompting method to evaluate.",
+    )
+    parser.add_argument(
+        "--llm_judge",
+        action="store_true",
+        help="Also run the LLM judge for FORMULA questions. The rule judge always runs.",
+    )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=8,
+        help="Number of parallel model requests.",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="results/evaluation",
+        help="Output directory for results.",
+    )
+    parser.add_argument(
+        "--sample_size",
+        type=int,
+        default=None,
+        help="Optional number of filtered samples to evaluate.",
+    )
     return parser.parse_args()
 
 
+def load_method(method_name):
+    module_name, function_name = METHOD_IMPORTS[method_name]
+    return getattr(importlib.import_module(module_name), function_name)
 
+
+def filter_data(data, method_name, is_multimodal):
+    if method_name in {"tool", "correction"}:
+        filtered = [entry for entry in data if image_count(entry) == 0]
+        print(f"{method_name}: using {len(filtered)}/{len(data)} text-only questions.")
+        return filtered
+    if not is_multimodal:
+        filtered = [entry for entry in data if image_count(entry) == 0]
+        print(f"Text-only model: using {len(filtered)}/{len(data)} questions without images.")
+        return filtered
+    print(f"Multimodal model: using all {len(data)} questions.")
+    return data
+
+
+def run_model_requests(entries, method, model_name, max_tokens, temperature, is_multimodal, num_workers):
+    responses = [None] * len(entries)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        future_to_index = {
+            executor.submit(
+                method,
+                entry,
+                model_name,
+                max_tokens,
+                temperature,
+                is_multimodal,
+            ): index
+            for index, entry in enumerate(entries)
+        }
+
+        for future in tqdm(
+            concurrent.futures.as_completed(future_to_index),
+            total=len(future_to_index),
+            desc="Generating answers",
+        ):
+            index = future_to_index[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                entry = entries[index]
+                print(f"Error processing question {entry.get('qid', 'unknown')}: {exc}")
+                continue
+            if result:
+                result["has_image"] = bool(result.get("image_count", 0))
+                responses[index] = result
+    return [response for response in responses if response is not None]
+
+
+def output_fieldnames(rows):
+    preferred = [
+        "qid",
+        "question_type",
+        "question",
+        "final_answer",
+        "correct_answer",
+        "is_correct",
+        "judge_reasoning",
+        "rule_is_correct",
+        "rule_judge_reasoning",
+        "llm_is_correct",
+        "llm_judge_reasoning",
+        "full_output",
+        "correct_solution",
+        "unit",
+        "number_of_answers",
+        "domain",
+        "new_token_nums",
+        "image",
+        "image_count",
+        "has_image",
+        "error",
+    ]
+    all_keys = set()
+    for row in rows:
+        all_keys.update(row.keys())
+    return [key for key in preferred if key in all_keys] + sorted(all_keys - set(preferred))
+
+
+def safe_model_filename(model_key):
+    return model_key.split("/")[-1].lower().replace(":", "_").replace(" ", "_")
 
 
 def main():
     args = parse_args()
 
-    # Validate that at least one judge is enabled
-    if not args.llm_judge and not args.rule_judge:
-        print("Error: At least one of --llm_judge or --rule_judge must be specified.")
-        return
-
-    # Load the QA dataset from CSV.
     try:
-        with open(args.input, 'r') as f:
-            reader = csv.DictReader(f)
-            data = list(reader)
-    except Exception as e:
-        print(f"Error loading file {args.input}: {e}")
+        model_config = get_model_config(args.model)
+        configure_openai_compatible_client(model_config)
+        if args.llm_judge:
+            get_api_key(get_model_config(FORMULA_JUDGE_MODEL))
+    except (KeyError, RuntimeError) as exc:
+        print(f"Error: {exc}")
         return
 
-    print(f"Loaded {len(data)} questions.")
-    if data:
-        # Print first row safely using dictionary access
-        print(f"Sample: {data[0].get('question', 'N/A')} - {data[0].get('answer', 'N/A')}")
+    try:
+        data = load_eval_data(args.dataset, args.split)
+    except Exception as exc:
+        print(f"Error loading dataset {args.dataset} split {args.split}: {exc}")
+        return
 
-    # Set API keys from environment variables with fallback to command line arguments
-    openai_api_key = os.environ.get("OPENAI_API_KEY", args.gpt_api_key)
-    gemini_api_key = os.environ.get("GEMINI_API_KEY", args.gemini_api_key)
-    claude_api_key = os.environ.get("ANTHROPIC_API_KEY", args.claude_api_key)
-    deepseek_api_key = os.environ.get("DEEPSEEK_API_KEY", args.deepseek_api_key)
-    qwen_api_key = os.environ.get("QWEN_API_KEY", args.qwen_api_key)
-    lambda_api_key = os.environ.get("LAMBDA_API_KEY", args.lambda_api_key)
-    # Determine model type
-    is_openai_model = args.model.startswith("gpt") or args.model.startswith("o4") or args.model.startswith("o3") or args.model.startswith("o1")
-    is_gemini_model = args.model.startswith("gemini")
-    is_claude_model = args.model.startswith("claude")
-    is_deepseek_model = args.model.startswith("deepseek")
-    is_qwen_model = args.model.startswith("qwen3") or args.model.startswith("qwq")
-    is_llama_model = args.model.startswith("llama")
-    model_type = "vllm"  # default
-    
-    # Initialize model and API keys
-    llm = None
-    sampling_params = None
-
-    if is_openai_model:
-        if not openai_api_key:
-            print("Error: A valid OpenAI API key is required via OPENAI_API_KEY environment variable or --gpt_api_key argument.")
-            return
-        print(f"Using OpenAI model: {args.model}")
-        openai.api_key = openai_api_key
-        model_type = "openai"
-    elif is_gemini_model:
-        if not gemini_api_key:
-            print("Error: A valid Gemini API key is required via GEMINI_API_KEY environment variable or --gemini_api_key argument.")
-            return
-        print(f"Using Gemini model: {args.model}")
-        genai.configure(api_key=gemini_api_key)
-        model_type = "gemini"
-    elif is_claude_model:
-        if not claude_api_key:
-            print("Error: A valid Claude API key is required via ANTHROPIC_API_KEY environment variable or --claude_api_key argument.")
-            return
-        print(f"Using Claude model: {args.model}")
-        anthropic.api_key = claude_api_key
-        model_type = "claude"
-    elif is_deepseek_model:
-        if not deepseek_api_key:
-            print("Error: A valid DeepSeek API key is required via DEEPSEEK_API_KEY environment variable or --deepseek_api_key argument.")
-            return
-        print(f"Using DeepSeek model: {args.model}")
-        # Configure OpenAI client for DeepSeek
-        openai.api_key = deepseek_api_key
-        openai.base_url = "https://api.deepseek.com"
-        model_type = "deepseek"
-    elif is_qwen_model:
-        if not qwen_api_key:
-            print("Error: A valid Qwen API key is required via QWEN_API_KEY environment variable or --qwen_api_key argument.")
-            return
-        print(f"Using Qwen model: {args.model}")
-        # Configure OpenAI client for Qwen
-        openai.api_key = qwen_api_key
-        openai.base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-        model_type = "qwen"
-    elif is_llama_model:
-        if not lambda_api_key:
-            print("Error: A valid Lambda API key is required via LAMBDA_API_KEY environment variable or --lambda_api_key argument.")
-            return
-        print(f"Using Llama model: {args.model}")
-        # Configure OpenAI client for Lambda
-        openai.api_key = lambda_api_key
-        openai.base_url = "https://api.lambda.ai/v1"
-        model_type = "llama"
-    else:
-        from vllm import LLM, SamplingParams
-        import torch
-        # Initialize the vLLM engine for the specified model.
-        print(f"Using vLLM model: {args.model}")
-        
-        # Use all available GPUs
-        gpu_count = torch.cuda.device_count()
-        print(f"Using all {gpu_count} GPUs with tensor parallelism")
-        
-        llm = LLM(
-            model=args.model, 
-            dtype='bfloat16', 
-            max_model_len=20000,
-            tensor_parallel_size=gpu_count,
-            trust_remote_code=True
-        )
-        # Set sampling parameters.
-        sampling_params = SamplingParams(
-            temperature=args.temperature,
-            top_p=1.0,
-            max_tokens=args.max_tokens
-        )
-
-
-    is_multimodal = any(mm_model in args.model.lower() for mm_model in MULTIMODAL_MODELS)
-    
-    # Filter questions based on model capabilities
-    filtered_data = data
-    if not is_multimodal:
-        # For non-multimodal models, only evaluate questions without images
-        filtered_data = [entry for entry in data if not entry.get('image') or not entry['image'].strip()]
-        print(f"Non-multimodal model: filtering to {len(filtered_data)}/{len(data)} questions without images")
-    else:
-        print(f"Multimodal model: evaluating all {len(data)} questions")
-    
-    if args.sample_size:
+    print(f"Loaded {len(data)} questions from {args.dataset}/{args.split}.")
+    filtered_data = filter_data(data, args.method, model_config.multimodal)
+    if args.sample_size is not None:
         filtered_data = filtered_data[:args.sample_size]
-    
-    # Process all models using parallel execution or batch processing for vLLM
-    responses = []
-    
-    temperature = args.temperature
-    if args.method == "base":
-        method = base
-    elif args.method == "tool":
-        method = tool_augmentation
-    elif args.method == "correction":
-        method = self_correction
-    elif args.method == "rag":
-        method = rag
-    elif args.method == "consistency":
-        method = self_consistency
-        temperature = 0.6
-    
-    print("Using method: ", args.method)
+        print(f"Sample size: {len(filtered_data)} questions.")
 
-    if model_type == "vllm":
-        # For vLLM, use batch processing for better throughput
-        print("Processing all requests in batch with vLLM...")
-        from utils.vllm_batch_processor import process_batch_vllm
-        responses = process_batch_vllm(
-            filtered_data, 
-            method,
-            args.model, 
-            args.max_tokens, 
-            temperature,
-            llm,
-            sampling_params,
-            is_multimodal
-        )
-    else:
-        # For API-based models, use batch processing if enabled
-        if args.use_batch and (is_openai_model or is_claude_model):
-            print("Using batch processing for cost-effective evaluation...")
+    method = load_method(args.method)
+    temperature = 0.6 if args.method == "consistency" else args.temperature
+    print(
+        "Evaluating "
+        f"{model_config.model_name} via {model_config.endpoint_url} "
+        f"with method={args.method}, workers={args.num_workers}."
+    )
 
-            try:
-                # Special handling for tool augmentation method
-                if args.method == "tool":
-                    print("Using multi-round batch processing for tool augmentation...")
-                    from methods.tool_augmentation import tool_augmentation_batch
+    responses = run_model_requests(
+        filtered_data,
+        method,
+        model_config.model_name,
+        args.max_tokens,
+        temperature,
+        model_config.multimodal,
+        args.num_workers,
+    )
 
-                    if is_openai_model:
-                        model_type_for_batch = "openai"
-                    elif is_claude_model:
-                        model_type_for_batch = "anthropic"
-                    else:
-                        raise ValueError(f"Unsupported model type for batch tool augmentation: {args.model}")
+    for response in responses:
+        response["dataset"] = args.dataset
+        response["split"] = args.split
+        response["model"] = args.model
 
-                    responses = tool_augmentation_batch(
-                        filtered_data,
-                        args.model,
-                        args.max_tokens,
-                        temperature,
-                        model_type_for_batch,
-                        is_multimodal
-                    )
-                else:
-                    # Use regular batch processing for other methods
-                    from utils.batch_processor import process_batch_openai, process_batch_claude
+    from evaluation.auto_judge import judge_responses
 
-                    if is_openai_model:
-                        responses = process_batch_openai(
-                            filtered_data,
-                            method,
-                            args.model,
-                            args.max_tokens,
-                            temperature,
-                            is_multimodal
-                        )
-                    elif is_claude_model:
-                        responses = process_batch_claude(
-                            filtered_data,
-                            method,
-                            args.model,
-                            args.max_tokens,
-                            temperature,
-                            is_multimodal
-                        )
+    decisions = judge_responses(
+        responses,
+        max_workers=32,
+        use_llm_formula=args.llm_judge,
+    )
 
-                # Add image information to responses
-                for response in responses:
-                    if 'has_image' not in response:
-                        response["has_image"] = bool((response.get("image_path") and response["image_path"].strip()) or
-                                                   (response.get("image") and response["image"].strip()))
+    if not decisions:
+        print(f"Warning: no decisions were generated; responses={len(responses)}.")
+        return
 
-            except Exception as e:
-                print(f"Batch processing failed: {e}")
-                return  # Exit instead of falling back
-
-        if not args.use_batch or not (is_openai_model or is_claude_model):
-            # Use parallel processing for non-batch modes or unsupported models
-            if not args.num_workers:
-                if is_openai_model:
-                    max_workers = 4
-                elif is_claude_model:
-                    max_workers = 2
-                elif is_deepseek_model:
-                    max_workers = 32
-                else:
-                    max_workers = 8
-            else:
-                max_workers = args.num_workers
-
-            print(f"Processing requests in parallel with {max_workers} workers...")
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Create a list of future tasks
-                future_to_entry = {
-                    executor.submit(
-                        method,
-                        entry,
-                        args.model,
-                        args.max_tokens,
-                        temperature,
-                        model_type,
-                        llm,
-                        sampling_params,
-                        is_multimodal
-                    ): entry for entry in filtered_data
-                }
-
-                # Process results as they complete with tqdm for progress
-                for future in tqdm(concurrent.futures.as_completed(future_to_entry), total=len(filtered_data)):
-                    result = future.result()
-                    if result:
-                        # Add information about whether this question has an image
-                        result["has_image"] = bool((result.get("image_path") and result["image_path"].strip()) or
-                                                  (result.get("image") and result["image"].strip()))
-                        responses.append(result)
-
-    # Now handle the LLM-based judging in parallel for free response questions
-    # print(predictions)
-
-    decisions = judge_responses(responses, max_workers=32, use_llm=args.llm_judge, use_rule=args.rule_judge)
-    
-    
-
-    model_name = args.model.split('/')[-1].lower()
-    # Create a results directory in the same directory as the input file
-    results_dir = args.output_dir
-
-    # Add timestamp to filename
+    os.makedirs(args.output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    os.makedirs(results_dir, exist_ok=True)  # Create the directory if it doesn't exist
-    csv_output_path = os.path.join(results_dir, f"{model_name}_{args.method}_{timestamp}.csv")
+    csv_output_path = os.path.join(
+        args.output_dir,
+        f"{safe_model_filename(args.model)}_{args.method}_{timestamp}.csv",
+    )
 
-    
-    # Before writing to CSV, ensure all dictionaries have a consistent set of keys
-    if decisions:
-        # Get a union of all keys present in any dictionary
-        all_keys = set()
-        for decision in decisions:
-            all_keys.update(decision.keys())
-        
-        # Ensure all dictionaries have all keys
-        for decision in decisions:
-            for key in all_keys:
-                if key not in decision:
-                    decision[key] = None  # Add missing key with None value
-        
-        # Now write to CSV
-        with open(csv_output_path, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=list(all_keys))
-            writer.writeheader()
-            writer.writerows(decisions)
-        print(f"Saved responses and decisions to {csv_output_path}")
-    else:
-        # No decisions were produced, so no file will be created.
-        # Provide a helpful message to the user instead of a misleading save path.
-        num_responses = len(responses) if isinstance(responses, list) else 0
-        print(
-            "Warning: No decisions were generated; CSV not written. "
-            f"responses={num_responses}, decisions=0. "
-            "If you used batch mode, results may not have been retrieved correctly. "
-            "Try running without --use_batch, verify API keys, or check batch result fetching."
-        )
-    
+    fieldnames = output_fieldnames(decisions)
+    for decision in decisions:
+        for key in fieldnames:
+            decision.setdefault(key, None)
+
+    with open(csv_output_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(decisions)
+
+    print(f"Saved responses and decisions to {csv_output_path}")
 
 
 if __name__ == "__main__":

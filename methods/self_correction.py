@@ -1,5 +1,5 @@
 from utils import generate_with_api, extract_final_answer
-from utils.vllm_api import generate_with_vllm
+from utils.image_inputs import entry_images, image_count, image_summary
 from methods.prompts import SYSTEM_PROMPT, FEEDBACK_PROMPT, CORRECTION_PROMPT
 
 def prepare_prompt(entry, is_multimodal=False):
@@ -20,8 +20,8 @@ def prepare_prompt(entry, is_multimodal=False):
 
     return {"messages": conversation}
 
-def self_correction(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
-    """Process a single entry with self-correction for any model type"""
+def self_correction(entry, model, max_tokens, temperature, is_multimodal=False):
+    """Process a single entry with self-correction."""
     try:
         question_text = entry["question"]
         if entry["unit"].strip() != "":
@@ -36,18 +36,13 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
         correct = str(entry["answer"]).strip() if entry["answer"] is not None else ""
         domain = entry.get("domain", "")
         correct_solution = entry.get("solution", "")
-        image_path_raw = entry.get("image", "").strip()
+        images = entry_images(entry)
         number_of_answers = entry.get("number_of_answers", "")
         unit = entry.get("unit", "")
-        # Parse multiple image paths if present (comma-separated)
-        image_paths = []
-        if image_path_raw and image_path_raw.lower() != "nan":
-            # Split by comma and strip whitespace from each path
-            image_paths = [path.strip() for path in image_path_raw.split(',') if path.strip()]
         
         # Only pass images if the model is multimodal
         if not is_multimodal:
-            image_paths = []
+            images = []
         
         # Step 1: Generate initial answer
         conversation = [
@@ -55,19 +50,13 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
             {"role": "user", "content": question_text}
         ]
 
-        if model_type == "vllm":  # vLLM model
-            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
-            initial_output = response["text"].strip()
-            initial_token_nums = response["token_ids"]
-        else:
-            initial_output, initial_token_nums = generate_with_api(
-                model_type,
-                model,
-                conversation,
-                max_tokens,
-                temperature,
-                image_paths
-            )
+        initial_output, initial_token_nums = generate_with_api(
+            model,
+            conversation,
+            max_tokens,
+            temperature,
+            images
+        )
         
         # Step 2: Ask for review and identification of problems
         
@@ -78,19 +67,13 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
             {"role": "user", "content": FEEDBACK_PROMPT}
         ]
 
-        if model_type == "vllm":
-            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
-            review_output = response["text"].strip()
-            review_token_nums = response["token_ids"]
-        else:
-            review_output, review_token_nums = generate_with_api(
-                model_type,
-                model,
-                conversation,
-                max_tokens,
-                temperature,
-                image_paths
-            )
+        review_output, review_token_nums = generate_with_api(
+            model,
+            conversation,
+            max_tokens,
+            temperature,
+            images
+        )
         
         # Step 3: Ask for improved answer based on identified problems
                 
@@ -103,19 +86,13 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
             {"role": "user", "content": CORRECTION_PROMPT}
         ]
 
-        if model_type == "vllm":
-            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
-            final_output = response["text"].strip()
-            final_token_nums = response["token_ids"]
-        else:
-            final_output, final_token_nums = generate_with_api(
-                model_type,
-                model,
-                conversation,
-                max_tokens,
-                temperature,
-                image_paths
-            )
+        final_output, final_token_nums = generate_with_api(
+            model,
+            conversation,
+            max_tokens,
+            temperature,
+            images
+        )
         
         # Concatenate all outputs for the full conversation
         full_output = f"{initial_output}\n\n{FEEDBACK_PROMPT}\n\n{review_output}\n\n{CORRECTION_PROMPT}\n\n{final_output}"
@@ -138,7 +115,8 @@ def self_correction(entry, model, max_tokens, temperature, model_type, llm=None,
             "number_of_answers": number_of_answers,
             "domain": domain,
             "new_token_nums": new_token_nums,
-            "image": image_path_raw
+            "image": image_summary(entry),
+            "image_count": image_count(entry),
         }
     
     except Exception as err:

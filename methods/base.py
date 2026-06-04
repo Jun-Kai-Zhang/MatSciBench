@@ -1,5 +1,5 @@
 from utils import generate_with_api, extract_final_answer
-from utils.vllm_api import generate_with_vllm
+from utils.image_inputs import entry_images, image_count, image_summary
 
 from methods.prompts import SYSTEM_PROMPT
 
@@ -23,8 +23,8 @@ def prepare_prompt(entry, is_multimodal=False):
 
 
 
-def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
-    """Process a single entry for any model type in parallel"""
+def base(entry, model, max_tokens, temperature, is_multimodal=False):
+    """Process a single entry through the configured OpenAI-compatible API."""
     try:
         question_text = entry["question"]
         if entry["unit"].strip() != "":
@@ -38,44 +38,26 @@ def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_p
         correct = str(entry["answer"]).strip() if entry["answer"] is not None else ""
         domain = entry.get("domain", "")
         correct_solution = entry.get("solution", "")
-        image_path_raw = entry.get("image", "").strip()
+        images = entry_images(entry)
         number_of_answers = entry.get("number_of_answers", "")
         unit = entry.get("unit", "")
-        # Parse multiple image paths if present (comma-separated)
-        image_paths = []
-        if image_path_raw and image_path_raw.lower() != "nan":
-            # Split by comma and strip whitespace from each path
-            image_paths = [path.strip() for path in image_path_raw.split(',') if path.strip()]
         
         # Only pass images if the model is multimodal
         if not is_multimodal:
-            image_paths = []
+            images = []
             
         conversation = [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": question_text}
         ]
-        # print("image path: ", image_paths)
-        if model_type == "vllm":  # vLLM model
-            response = generate_with_vllm(llm, sampling_params, conversation, image_paths)
-            full_output = response["text"].strip()
-            new_token_nums = response["token_ids"]
-            error = None
-        else:
-            full_output, new_token_nums = generate_with_api(
-                model_type,
-                model,
-                conversation,
-                max_tokens,
-                temperature,
-                image_paths
-            )
-            # Extract error message if present (for Gemini models)
-            error = None
-            if model_type == "gemini" and full_output.startswith("Error:"):
-                error_lines = full_output.split("\n")
-                error = error_lines[0].replace("Error:", "").strip()
-                full_output = "\n".join(error_lines[1:]).strip() if len(error_lines) > 1 else ""
+
+        full_output, new_token_nums = generate_with_api(
+            model,
+            conversation,
+            max_tokens,
+            temperature,
+            images
+        )
 
         final_answer = extract_final_answer(full_output) if full_output else ""
 
@@ -91,8 +73,8 @@ def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_p
             "number_of_answers": number_of_answers,
             "domain": domain,
             "new_token_nums": new_token_nums,
-            "image": image_path_raw,
-            "error": error  # Include error message in the return value
+            "image": image_summary(entry),
+            "image_count": image_count(entry),
         }
     
     except Exception as err:
@@ -112,67 +94,3 @@ def base(entry, model, max_tokens, temperature, model_type, llm=None, sampling_p
             "image": "",
             "error": str(err)  # Include the error message from the exception
         }
-
-
-
-# def cot(entry, model, max_tokens, temperature, model_type, llm=None, sampling_params=None, is_multimodal=False):
-#     """Process a single entry for any model type in parallel"""
-#     try:
-#         question_text = entry["question"]
-#         q_type = entry["type"]
-#         correct = str(entry["answer"]).strip() if entry["answer"] is not None else ""
-#         domain = entry.get("domain", "")
-#         correct_solution = entry.get("solution", "")
-#         image_path_raw = entry.get("image", "").strip()
-#         number_of_answers = entry.get("number_of_answers", "")
-#         unit = entry.get("unit", "")
-#         # Parse multiple image paths if present (comma-separated)
-#         image_paths = []
-#         if image_path_raw and image_path_raw.lower() != "nan":
-#             # Split by comma and strip whitespace from each path
-#             image_paths = [path.strip() for path in image_path_raw.split(',') if path.strip()]
-        
-#         # Only pass images if the model is multimodal
-#         if not is_multimodal:
-#             image_paths = []
-            
-#         conversation = [
-#             {"role": "system", "content": COT_SYSTEM_PROMPT},
-#             {"role": "user", "content": question_text}
-#         ]
-
-#         if model_type == "vllm":  # vLLM model
-#             output = llm.chat(conversation, sampling_params=sampling_params, use_tqdm=False)
-#             full_output = output[0].outputs[0].text.strip()
-#             new_token_nums = len(output[0].outputs[0].token_ids)
-#         else:
-#             full_output, new_token_nums = generate_with_api(
-#                 model_type,
-#                 model,
-#                 conversation,
-#                 max_tokens,
-#                 temperature,
-#                 image_paths
-#             )
-
-#         final_answer = extract_final_answer(full_output)
-
-#         return {
-#             "qid": entry.get("qid", ""),
-#             "question_type": q_type,
-#             "question": question_text,
-#             "full_output": full_output,
-#             "final_answer": final_answer,
-#             "correct_solution": correct_solution,
-#             "correct_answer": correct,
-#             "unit": unit,
-#             "number_of_answers": number_of_answers,
-#             "domain": domain,
-#             "new_token_nums": new_token_nums
-#         }
-    
-#     except Exception as err:
-#         print(f"Error processing question {entry.get('qid', 'unknown')}: {err}")
-#         return None
-
-

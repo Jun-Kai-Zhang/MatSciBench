@@ -17,21 +17,5 @@ TOOL_FINAL_ANSWER_PROMPT = (
 )
 
 
-FEEDBACK_PROMPT = "Review your previous answer and find problems with your answer." 
+FEEDBACK_PROMPT = "Review your previous answer and find problems with your answer."
 CORRECTION_PROMPT = "Based on the problems you found, improve your answer. Please reiterate your answer, with your final answer in the form \\boxed{answer}"
-
-
-# Prompt templates for RAG
-RAG_QUERY_PROMPT = (
-    "Given the following question, generate a concise search query to retrieve the most relevant and useful information for solving the question. "
-    "\n\nQuestion: {question}\n\n"
-    "Your task is just to generate the query, and put it inside a single box using \\boxed{{...}}. Don't solve the question, just generate the query."
-)
-
-
-RAG_SUMMARY_PROMPT = (
-    "Given the following question and a set of search results, summarize the most relevant and useful information needed to answer the question. "
-    "Focus only on the most necessary facts.\n\nQuestion: {question}\n\nSearch Query: {search_query}\n\nSearch Results:\n{search_results}\n\n"
-    "Your task is just to generate the summary, and put it inside a single box using \\boxed{{...}}. Don't solve the question, just generate the summary."
-)
-
