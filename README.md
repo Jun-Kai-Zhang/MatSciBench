@@ -59,7 +59,7 @@ print(dataset[0])
 Important columns include:
 
 - `qid`: question identifier
-- `type`: answer type, such as `NUM` or `FORMULA`
+- `type`: answer type, `NUM` or `FORMULA`
 - `question`: problem statement
 - `image`: embedded image inputs, or an empty list
 - `solution`: reference solution
